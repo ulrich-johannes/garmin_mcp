@@ -1,0 +1,38 @@
+# fly.toml — Fly.io deployment config for garmin-mcp
+# Deploy: flyctl deploy
+# Docs:   https://fly.io/docs/reference/configuration/
+
+app = "garmin-mcp-ut"
+primary_region = "fra"      # Frankfurt — close to Munich
+
+[build]
+  # Uses Dockerfile at repo root
+
+[env]
+  GARMIN_MCP_TRANSPORT = "streamable-http"
+  GARMIN_MCP_HOST      = "0.0.0.0"
+  GARMIN_MCP_PORT      = "8000"
+
+[http_service]
+  internal_port       = 8000
+  force_https         = true
+  auto_stop_machines  = false   # keep always-on; MCP handshake needs a live process
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type       = "requests"
+    hard_limit = 50
+    soft_limit = 25
+
+[[http_service.checks]]
+  grace_period = "15s"
+  interval     = "30s"
+  method       = "GET"
+  path         = "/healthz"
+  timeout      = "5s"
+
+[[vm]]
+  memory   = "256mb"
+  cpu_kind = "shared"
+  cpus     = 1

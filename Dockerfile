@@ -28,17 +28,15 @@ RUN uv pip install -e .
 COPY tests/ ./tests/
 COPY pytest.ini ./
 
-# Create directory for Garmin tokens
-RUN mkdir -p /root/.garminconnect && \
-    chmod 700 /root/.garminconnect
+# HTTP transport — bearer token is the Garmin OAuth token sent per-request.
+# No token files or credentials needed in the image.
+EXPOSE 8000
 
-# Expose the HTTP port. The image defaults to stdio (Claude Desktop, Inspector);
-# set GARMIN_MCP_TRANSPORT=streamable-http to serve over this port (e.g. in k8s).
-# EXPOSE 8000
+ENV GARMIN_MCP_TRANSPORT=streamable-http \
+    GARMIN_MCP_HOST=0.0.0.0 \
+    GARMIN_MCP_PORT=8000
 
-# Set the entrypoint to run the MCP server
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')" || exit 1
+
 ENTRYPOINT ["garmin-mcp"]
-
-# Health check (optional - adjust based on your needs)
-# HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-#   CMD python -c "import sys; sys.exit(0)"

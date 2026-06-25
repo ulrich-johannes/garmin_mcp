@@ -28,6 +28,8 @@ from garmin_mcp import nutrition
 from garmin_mcp import workout_builders
 from garmin_mcp import courses
 from garmin_mcp import activity_analysis
+from garmin_mcp.auth import GarminTokenAuthProvider
+from garmin_mcp.middleware import GarminAuthMiddleware
 
 
 def is_interactive_terminal() -> bool:
@@ -208,6 +210,31 @@ class _ToolFilter:
 # ---------------------------------------------------------------------------
 
 
+def _configure_all_modules(client) -> None:
+    """Push a resolved Garmin client into every module's global.
+
+    Called once per unique user on first request (Phase 1: single user, fires
+    exactly once).  Phase 2 upgrade: replace module globals with a ContextVar
+    and update this function (or remove it) — the AuthProvider and middleware
+    interfaces stay unchanged.
+    """
+    activity_management.configure(client)
+    health_wellness.configure(client)
+    user_profile.configure(client)
+    devices.configure(client)
+    gear_management.configure(client)
+    weight_management.configure(client)
+    challenges.configure(client)
+    training.configure(client)
+    workouts.configure(client)
+    data_management.configure(client)
+    womens_health.configure(client)
+    nutrition.configure(client)
+    workout_builders.configure(client)
+    courses.configure(client)
+    activity_analysis.configure(client)
+
+
 def init_api(email, password):
     """Initialize Garmin API with your credentials."""
     import io
@@ -355,33 +382,24 @@ def main():
         print(str(exc), file=sys.stderr)
         sys.exit(1)
 
-    # Initialize Garmin client
-    garmin_client = init_api(email, password)
-    if not garmin_client:
-        print("Failed to initialize Garmin Connect client. Exiting.", file=sys.stderr)
-        return
+    # --- stdio path (unchanged) ------------------------------------------------
+    # stdio is used by Claude Desktop and MCP Inspector.  Garmin client is
+    # initialised once at startup from local token files or credentials.
+    if transport == "stdio":
+        garmin_client = init_api(email, password)
+        if not garmin_client:
+            print("Failed to initialize Garmin Connect client. Exiting.", file=sys.stderr)
+            return
+        print("Garmin Connect client initialized successfully.", file=sys.stderr)
+        garmin_client = _GarminProxy(garmin_client)
+        _configure_all_modules(garmin_client)
 
-    print("Garmin Connect client initialized successfully.", file=sys.stderr)
-
-    # Wrap client so runtime auth/rate-limit errors surface as clear messages
-    garmin_client = _GarminProxy(garmin_client)
-
-    # Configure all modules with the Garmin client
-    activity_management.configure(garmin_client)
-    health_wellness.configure(garmin_client)
-    user_profile.configure(garmin_client)
-    devices.configure(garmin_client)
-    gear_management.configure(garmin_client)
-    weight_management.configure(garmin_client)
-    challenges.configure(garmin_client)
-    training.configure(garmin_client)
-    workouts.configure(garmin_client)
-    data_management.configure(garmin_client)
-    womens_health.configure(garmin_client)
-    nutrition.configure(garmin_client)
-    workout_builders.configure(garmin_client)
-    courses.configure(garmin_client)
-    activity_analysis.configure(garmin_client)
+    # --- HTTP path (MCP connector) --------------------------------------------
+    # For streamable-http and sse the bearer token sent by the Claude API IS
+    # the user's Garmin OAuth token (base64).  No local token storage needed;
+    # the server is stateless.  Garmin client is resolved per-user on the first
+    # request and cached (LRU) for the lifetime of the process.
+    # Credentials / token-file env vars are intentionally ignored here.
 
     # Create the MCP app, wrapped so the env-var filter can drop tools.
     # host/port only matter for the HTTP transports; stdio ignores them.
@@ -420,23 +438,231 @@ def main():
             file=sys.stderr,
         )
 
-    # When serving over HTTP, expose a plain health endpoint for k8s probes.
-    # The MCP endpoint itself requires a handshake and isn't probe-friendly.
-    if transport != "stdio":
-        from starlette.requests import Request
-        from starlette.responses import PlainTextResponse
+    if transport == "stdio":
+        app.run(transport="stdio")
+        return
 
-        @fastmcp.custom_route("/healthz", methods=["GET"])
-        async def healthz(_request: "Request") -> "PlainTextResponse":
-            return PlainTextResponse("ok")
+    # HTTP transports — OAuth 2.0 Authorization Code + PKCE, then MCP with bearer auth.
+    import base64 as _b64
+    import hashlib as _hashlib
+    import secrets as _secrets
+    import time as _time
 
-        print(
-            f"Serving MCP over {transport} on {http_host}:{http_port}",
-            file=sys.stderr,
+    from starlette.requests import Request
+    from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
+
+    # In-memory auth-code store (single process, 5-minute TTL).
+    # Each entry: {token, challenge, expires}
+    _code_store: dict = {}
+
+    def _issue_code(garmin_token: str, code_challenge: str) -> str:
+        code = _secrets.token_urlsafe(32)
+        _code_store[code] = {
+            "token": garmin_token,
+            "challenge": code_challenge,
+            "expires": _time.time() + 300,
+        }
+        return code
+
+    def _redeem_code(code: str, code_verifier: str) -> str | None:
+        entry = _code_store.pop(code, None)
+        if not entry or _time.time() > entry["expires"]:
+            return None
+        digest = _hashlib.sha256(code_verifier.encode()).digest()
+        expected = _b64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+        if expected != entry["challenge"]:
+            return None
+        return entry["token"]
+
+    # Create auth provider before the route closures that reference it.
+    auth_provider = GarminTokenAuthProvider(is_cn=is_cn)
+
+    _AUTHORIZE_HTML = """\
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Connect Garmin to Claude</title>
+  <style>
+    *{{box-sizing:border-box}}
+    body{{font-family:system-ui,sans-serif;max-width:460px;margin:80px auto;padding:0 24px;color:#111}}
+    h1{{font-size:1.25rem;font-weight:700;margin-bottom:6px}}
+    p{{color:#555;font-size:.9rem;line-height:1.5;margin:0 0 12px}}
+    code{{background:#f3f4f6;padding:2px 6px;border-radius:3px;font-size:.78rem;word-break:break-all}}
+    label{{display:block;font-size:.85rem;font-weight:600;margin:16px 0 6px}}
+    textarea{{width:100%;height:96px;font-family:monospace;font-size:.72rem;border:1px solid #d1d5db;border-radius:4px;padding:8px;resize:vertical}}
+    button{{margin-top:14px;background:#000;color:#fff;border:none;padding:12px 0;border-radius:4px;font-size:.95rem;cursor:pointer;width:100%}}
+    .err{{color:#dc2626;font-size:.85rem;margin-top:8px}}
+  </style>
+</head>
+<body>
+  <h1>Connect Garmin to Claude</h1>
+  <p>Paste your Garmin base64 token to let Claude read your training data.</p>
+  <p>Generate it on your Mac:<br>
+  <code>python3 -c "print(open('$HOME/.garminconnect_base64').read().strip())" | pbcopy</code></p>
+  <form method="POST">
+    <input type="hidden" name="state" value="{state}">
+    <input type="hidden" name="redirect_uri" value="{redirect_uri}">
+    <input type="hidden" name="code_challenge" value="{code_challenge}">
+    <input type="hidden" name="code_challenge_method" value="{code_challenge_method}">
+    <input type="hidden" name="client_id" value="{client_id}">
+    <label for="t">Garmin token</label>
+    <textarea id="t" name="garmin_token" placeholder="eyJ..." required></textarea>
+    {error}
+    <button type="submit">Authorize</button>
+  </form>
+</body>
+</html>"""
+
+    @fastmcp.custom_route("/healthz", methods=["GET"])
+    async def healthz(_request: "Request") -> "PlainTextResponse":
+        return PlainTextResponse("ok")
+
+    def _public_base(request: "Request") -> str:
+        """Reconstruct the public-facing base URL.
+
+        Fly.io (and most reverse proxies) terminate TLS at the edge and forward
+        plain HTTP to the container, so request.base_url has scheme=http even
+        though the public URL is https.  X-Forwarded-Proto carries the real scheme.
+        """
+        scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
+        host = request.headers.get("x-forwarded-host", request.url.netloc)
+        return f"{scheme}://{host}"
+
+    @fastmcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
+    async def oauth_metadata(request: "Request") -> "JSONResponse":
+        base = _public_base(request)
+        return JSONResponse({
+            "issuer": base,
+            "authorization_endpoint": f"{base}/authorize",
+            "token_endpoint": f"{base}/oauth/token",
+            "registration_endpoint": f"{base}/register",
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code"],
+            "code_challenge_methods_supported": ["S256"],
+        })
+
+    @fastmcp.custom_route("/register", methods=["POST"])
+    async def register(request: "Request") -> "JSONResponse":
+        """RFC 7591 Dynamic Client Registration — accept any client, no stored state.
+
+        We don't validate or store client metadata; the Garmin token entered at
+        /authorize is the real credential.  We just hand back a client_id so
+        claude.ai can proceed with the Authorization Code flow.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        client_id = body.get("client_id") or _secrets.token_urlsafe(16)
+        return JSONResponse(
+            {
+                "client_id": client_id,
+                "client_id_issued_at": int(_time.time()),
+                "redirect_uris": body.get("redirect_uris", []),
+                "grant_types": ["authorization_code"],
+                "response_types": ["code"],
+                "token_endpoint_auth_method": "none",
+            },
+            status_code=201,
         )
 
-    # Run the MCP server
-    app.run(transport=transport)
+    @fastmcp.custom_route("/authorize", methods=["GET", "POST"])
+    async def authorize(request: "Request") -> "HTMLResponse | RedirectResponse":  # noqa: F811
+        if request.method == "GET":
+            p = request.query_params
+            html = _AUTHORIZE_HTML.format(
+                state=p.get("state", ""),
+                redirect_uri=p.get("redirect_uri", ""),
+                code_challenge=p.get("code_challenge", ""),
+                code_challenge_method=p.get("code_challenge_method", "S256"),
+                client_id=p.get("client_id", ""),
+                error="",
+            )
+            return HTMLResponse(html)
+
+        # POST — validate token, issue code, redirect back to claude.ai
+        form = await request.form()
+        state = form.get("state", "")
+        redirect_uri = form.get("redirect_uri", "")
+        code_challenge = form.get("code_challenge", "")
+        code_challenge_method = form.get("code_challenge_method", "S256")
+        client_id = form.get("client_id", "")
+        garmin_token = (form.get("garmin_token") or "").strip()
+
+        ctx = auth_provider.resolve(garmin_token)
+        if ctx is None:
+            html = _AUTHORIZE_HTML.format(
+                state=state, redirect_uri=redirect_uri,
+                code_challenge=code_challenge, code_challenge_method=code_challenge_method,
+                client_id=client_id,
+                error='<p class="err">Invalid token — check your Garmin base64 token and try again.</p>',
+            )
+            return HTMLResponse(html, status_code=400)
+
+        code = _issue_code(garmin_token, code_challenge)
+        sep = "&" if "?" in redirect_uri else "?"
+        return RedirectResponse(f"{redirect_uri}{sep}code={code}&state={state}", status_code=302)
+
+    @fastmcp.custom_route("/oauth/token", methods=["POST"])
+    async def oauth_token(request: "Request") -> "JSONResponse":
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            body = await request.json()
+            grant_type = body.get("grant_type", "")
+            code = body.get("code", "")
+            code_verifier = body.get("code_verifier", "")
+        else:
+            form = await request.form()
+            grant_type = form.get("grant_type", "")
+            code = form.get("code", "")
+            code_verifier = form.get("code_verifier", "")
+
+        if grant_type != "authorization_code":
+            return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+
+        garmin_token = _redeem_code(code, code_verifier)
+        if garmin_token is None:
+            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+
+        return JSONResponse({
+            "access_token": garmin_token,
+            "token_type": "bearer",
+            "expires_in": 3600,
+        })
+
+    def _on_new_client(raw_client) -> None:
+        """Wrap and push a freshly resolved Garmin client into all modules."""
+        _configure_all_modules(_GarminProxy(raw_client))
+
+    if transport == "streamable-http":
+        starlette_app = fastmcp.streamable_http_app()
+    else:  # sse
+        starlette_app = fastmcp.sse_app()
+
+    wrapped_app = GarminAuthMiddleware(starlette_app, auth_provider, on_new_client=_on_new_client)
+
+    print(
+        f"Serving MCP over {transport} on {http_host}:{http_port} "
+        "(bearer token = base64 Garmin OAuth token)",
+        file=sys.stderr,
+    )
+
+    import anyio
+    import uvicorn
+
+    async def _serve() -> None:
+        config = uvicorn.Config(
+            wrapped_app,
+            host=http_host,
+            port=http_port,
+            log_level="warning",
+        )
+        server = uvicorn.Server(config)
+        await server.serve()
+
+    anyio.run(_serve)
 
 
 if __name__ == "__main__":
