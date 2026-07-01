@@ -448,12 +448,27 @@ def main():
     import secrets as _secrets
     import time as _time
 
+    import anyio
     from starlette.requests import Request
     from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 
     # In-memory auth-code store (single process, 5-minute TTL).
     # Each entry: {token, challenge, expires}
     _code_store: dict = {}
+
+    # In-memory login-session store for the email/password → MFA → token flow.
+    # Holds the live Garmin client object between the initial login() call and
+    # the resume_login() call, since MFA state lives on the object itself, not
+    # in a serializable value.  10-minute TTL — plenty of time to fetch an MFA
+    # code from email/SMS.
+    _login_sessions: dict = {}
+    _LOGIN_SESSION_TTL = 600
+
+    def _prune_login_sessions() -> None:
+        now = _time.time()
+        expired = [sid for sid, s in _login_sessions.items() if now > s["expires"]]
+        for sid in expired:
+            _login_sessions.pop(sid, None)
 
     def _issue_code(garmin_token: str, code_challenge: str) -> str:
         code = _secrets.token_urlsafe(32)
@@ -477,40 +492,66 @@ def main():
     # Create auth provider before the route closures that reference it.
     auth_provider = GarminTokenAuthProvider(is_cn=is_cn)
 
-    _AUTHORIZE_HTML = """\
+    _OAUTH_HIDDEN_FIELDS = """\
+    <input type="hidden" name="state" value="{state}">
+    <input type="hidden" name="redirect_uri" value="{redirect_uri}">
+    <input type="hidden" name="code_challenge" value="{code_challenge}">
+    <input type="hidden" name="code_challenge_method" value="{code_challenge_method}">
+    <input type="hidden" name="client_id" value="{client_id}">"""
+
+    _PAGE_STYLE = """\
+    *{{box-sizing:border-box}}
+    body{{font-family:system-ui,sans-serif;max-width:420px;margin:80px auto;padding:0 24px;color:#111}}
+    h1{{font-size:1.25rem;font-weight:700;margin-bottom:6px}}
+    p{{color:#555;font-size:.9rem;line-height:1.5;margin:0 0 12px}}
+    label{{display:block;font-size:.85rem;font-weight:600;margin:16px 0 6px}}
+    input[type=email],input[type=password],input[type=text]{{width:100%;font-size:.95rem;border:1px solid #d1d5db;border-radius:4px;padding:10px}}
+    button{{margin-top:14px;background:#000;color:#fff;border:none;padding:12px 0;border-radius:4px;font-size:.95rem;cursor:pointer;width:100%}}
+    .err{{color:#dc2626;font-size:.85rem;margin-top:8px}}"""
+
+    _LOGIN_HTML = """\
 <!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Connect Garmin to Claude</title>
-  <style>
-    *{{box-sizing:border-box}}
-    body{{font-family:system-ui,sans-serif;max-width:460px;margin:80px auto;padding:0 24px;color:#111}}
-    h1{{font-size:1.25rem;font-weight:700;margin-bottom:6px}}
-    p{{color:#555;font-size:.9rem;line-height:1.5;margin:0 0 12px}}
-    code{{background:#f3f4f6;padding:2px 6px;border-radius:3px;font-size:.78rem;word-break:break-all}}
-    label{{display:block;font-size:.85rem;font-weight:600;margin:16px 0 6px}}
-    textarea{{width:100%;height:96px;font-family:monospace;font-size:.72rem;border:1px solid #d1d5db;border-radius:4px;padding:8px;resize:vertical}}
-    button{{margin-top:14px;background:#000;color:#fff;border:none;padding:12px 0;border-radius:4px;font-size:.95rem;cursor:pointer;width:100%}}
-    .err{{color:#dc2626;font-size:.85rem;margin-top:8px}}
-  </style>
+  <style>""" + _PAGE_STYLE + """</style>
 </head>
 <body>
   <h1>Connect Garmin to Claude</h1>
-  <p>Paste your Garmin base64 token to let Claude read your training data.</p>
-  <p>Generate it on your Mac:<br>
-  <code>python3 -c "print(open('$HOME/.garminconnect_base64').read().strip())" | pbcopy</code></p>
+  <p>Sign in with your Garmin Connect account to let Claude read your training data.</p>
   <form method="POST">
-    <input type="hidden" name="state" value="{state}">
-    <input type="hidden" name="redirect_uri" value="{redirect_uri}">
-    <input type="hidden" name="code_challenge" value="{code_challenge}">
-    <input type="hidden" name="code_challenge_method" value="{code_challenge_method}">
-    <input type="hidden" name="client_id" value="{client_id}">
-    <label for="t">Garmin token</label>
-    <textarea id="t" name="garmin_token" placeholder="eyJ..." required></textarea>
+""" + _OAUTH_HIDDEN_FIELDS + """
+    <label for="email">Email</label>
+    <input type="email" id="email" name="email" required autofocus>
+    <label for="password">Password</label>
+    <input type="password" id="password" name="password" required>
     {error}
-    <button type="submit">Authorize</button>
+    <button type="submit">Sign in</button>
+  </form>
+</body>
+</html>"""
+
+    _MFA_HTML = """\
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Enter MFA code</title>
+  <style>""" + _PAGE_STYLE + """</style>
+</head>
+<body>
+  <h1>Enter your MFA code</h1>
+  <p>Garmin sent a verification code to your email or phone.</p>
+  <form method="POST">
+""" + _OAUTH_HIDDEN_FIELDS + """
+    <input type="hidden" name="login_session_id" value="{login_session_id}">
+    <label for="mfa_code">MFA code</label>
+    <input type="text" id="mfa_code" name="mfa_code" inputmode="numeric" required autofocus>
+    {error}
+    <button type="submit">Verify</button>
   </form>
 </body>
 </html>"""
@@ -568,42 +609,113 @@ def main():
             status_code=201,
         )
 
+    def _oauth_fields(form_or_params) -> dict:
+        return {
+            "state": form_or_params.get("state", ""),
+            "redirect_uri": form_or_params.get("redirect_uri", ""),
+            "code_challenge": form_or_params.get("code_challenge", ""),
+            "code_challenge_method": form_or_params.get("code_challenge_method", "S256"),
+            "client_id": form_or_params.get("client_id", ""),
+        }
+
+    def _finish_with_token(garmin_token_b64: str, oauth: dict) -> "RedirectResponse":
+        code = _issue_code(garmin_token_b64, oauth["code_challenge"])
+        redirect_uri = oauth["redirect_uri"]
+        sep = "&" if "?" in redirect_uri else "?"
+        return RedirectResponse(
+            f"{redirect_uri}{sep}code={code}&state={oauth['state']}", status_code=302
+        )
+
     @fastmcp.custom_route("/authorize", methods=["GET", "POST"])
     async def authorize(request: "Request") -> "HTMLResponse | RedirectResponse":  # noqa: F811
         if request.method == "GET":
-            p = request.query_params
-            html = _AUTHORIZE_HTML.format(
-                state=p.get("state", ""),
-                redirect_uri=p.get("redirect_uri", ""),
-                code_challenge=p.get("code_challenge", ""),
-                code_challenge_method=p.get("code_challenge_method", "S256"),
-                client_id=p.get("client_id", ""),
-                error="",
-            )
+            oauth = _oauth_fields(request.query_params)
+            html = _LOGIN_HTML.format(**oauth, error="")
             return HTMLResponse(html)
 
-        # POST — validate token, issue code, redirect back to claude.ai
         form = await request.form()
-        state = form.get("state", "")
-        redirect_uri = form.get("redirect_uri", "")
-        code_challenge = form.get("code_challenge", "")
-        code_challenge_method = form.get("code_challenge_method", "S256")
-        client_id = form.get("client_id", "")
-        garmin_token = (form.get("garmin_token") or "").strip()
+        oauth = _oauth_fields(form)
 
-        ctx = auth_provider.resolve(garmin_token)
-        if ctx is None:
-            html = _AUTHORIZE_HTML.format(
-                state=state, redirect_uri=redirect_uri,
-                code_challenge=code_challenge, code_challenge_method=code_challenge_method,
-                client_id=client_id,
-                error='<p class="err">Invalid token — check your Garmin base64 token and try again.</p>',
+        # Step 2: MFA code submitted for a login session already in progress.
+        login_session_id = form.get("login_session_id")
+        if login_session_id:
+            _prune_login_sessions()
+            session = _login_sessions.pop(login_session_id, None)
+            if session is None:
+                html = _LOGIN_HTML.format(
+                    **oauth,
+                    error='<p class="err">Session expired — please sign in again.</p>',
+                )
+                return HTMLResponse(html, status_code=400)
+
+            mfa_code = (form.get("mfa_code") or "").strip()
+            garmin = session["garmin"]
+            try:
+                await anyio.to_thread.run_sync(garmin.resume_login, None, mfa_code)
+            except (
+                GarminConnectAuthenticationError,
+                GarminConnectTooManyRequestsError,
+                GarminConnectConnectionError,
+            ) as exc:
+                html = _MFA_HTML.format(
+                    **oauth,
+                    login_session_id=login_session_id,
+                    error=f'<p class="err">{exc}</p>',
+                )
+                return HTMLResponse(html, status_code=400)
+            except Exception as exc:  # noqa: BLE001 — surface to the user, don't crash the route
+                html = _LOGIN_HTML.format(
+                    **oauth, error=f'<p class="err">Login failed: {exc}</p>'
+                )
+                return HTMLResponse(html, status_code=400)
+
+            token_json = garmin.client.dumps()
+            token_b64 = _b64.b64encode(token_json.encode()).decode()
+            return _finish_with_token(token_b64, oauth)
+
+        # Step 1: email + password submitted.
+        user_email = (form.get("email") or "").strip()
+        user_password = form.get("password") or ""
+        if not user_email or not user_password:
+            html = _LOGIN_HTML.format(
+                **oauth, error='<p class="err">Email and password are required.</p>'
             )
             return HTMLResponse(html, status_code=400)
 
-        code = _issue_code(garmin_token, code_challenge)
-        sep = "&" if "?" in redirect_uri else "?"
-        return RedirectResponse(f"{redirect_uri}{sep}code={code}&state={state}", status_code=302)
+        garmin = Garmin(
+            email=user_email,
+            password=user_password,
+            is_cn=is_cn,
+            return_on_mfa=True,
+        )
+        try:
+            mfa_status, _ = await anyio.to_thread.run_sync(garmin.login)
+        except (
+            GarminConnectAuthenticationError,
+            GarminConnectTooManyRequestsError,
+            GarminConnectConnectionError,
+        ) as exc:
+            html = _LOGIN_HTML.format(**oauth, error=f'<p class="err">{exc}</p>')
+            return HTMLResponse(html, status_code=400)
+        except Exception as exc:  # noqa: BLE001
+            html = _LOGIN_HTML.format(
+                **oauth, error=f'<p class="err">Login failed: {exc}</p>'
+            )
+            return HTMLResponse(html, status_code=400)
+
+        if mfa_status == "needs_mfa":
+            _prune_login_sessions()
+            login_session_id = _secrets.token_urlsafe(24)
+            _login_sessions[login_session_id] = {
+                "garmin": garmin,
+                "expires": _time.time() + _LOGIN_SESSION_TTL,
+            }
+            html = _MFA_HTML.format(**oauth, login_session_id=login_session_id, error="")
+            return HTMLResponse(html)
+
+        token_json = garmin.client.dumps()
+        token_b64 = _b64.b64encode(token_json.encode()).decode()
+        return _finish_with_token(token_b64, oauth)
 
     @fastmcp.custom_route("/oauth/token", methods=["POST"])
     async def oauth_token(request: "Request") -> "JSONResponse":
