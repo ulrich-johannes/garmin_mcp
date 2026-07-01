@@ -4,6 +4,8 @@
 
 This Model Context Protocol (MCP) server connects to Garmin Connect and exposes your fitness and health data to Claude and other MCP-compatible clients.
 
+Runs either locally over stdio (Claude Desktop, MCP Inspector) or as a remote HTTP server you deploy once (e.g. on Fly.io) and connect to from claude.ai. The remote mode speaks OAuth 2.0 Authorization Code + PKCE: connecting the server prompts you to sign in with your Garmin Connect email/password (MFA supported) right in the browser — no local token generation step, no stored credentials.
+
 Garmin's API is accessed via the awesome [python-garminconnect](https://github.com/cyberjunky/python-garminconnect) library.
 
 ## Features
